@@ -1,0 +1,101 @@
+# Build and analyze - runs on every push
+name: Build
+
+trigger:
+  branches:
+    include:
+      - '*'
+  tags:
+    exclude:
+      - '*'
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  - group: desktop-ci                        # SONAR_TOKEN, SONAR_HOST_URL (secrets)
+
+jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      name: Win-Build                        # self-hosted Windows pool
+    workspace:
+      clean: all
+    steps:
+      - checkout: self
+        fetchDepth: 0
+
+      - task: UseDotNet@2
+        displayName: Set up .NET 8
+        inputs:
+          packageType: sdk
+          version: 8.x
+
+      - task: JavaToolInstaller@0
+        displayName: Set up JDK 17 (needed by SonarScanner)
+        inputs:
+          versionSpec: '17'
+          jdkArchitectureOption: x64
+          jdkSourceOption: PreInstalled
+
+      - script: dotnet tool restore && dotnet tool list
+        displayName: Restore dotnet tools
+
+      - task: NuGetAuthenticate@1
+        displayName: Authenticate to internal NuGet feed
+
+      - script: dotnet restore Contoso.DesktopApp.sln
+        displayName: Restore dependencies
+        workingDirectory: src
+
+      - script: >-
+          dotnet tool run dotnet-sonarscanner begin
+          /k:"contoso-desktop-app"
+          /d:sonar.cs.vscoveragexml.reportsPaths=coverage.xml
+          /d:sonar.token="%SONAR_TOKEN%"
+          /d:sonar.host.url="%SONAR_HOST_URL%"
+        displayName: Sonar - begin analysis
+        workingDirectory: src
+        env:
+          SONAR_TOKEN: $(SONAR_TOKEN)
+          SONAR_HOST_URL: $(SONAR_HOST_URL)
+
+      - script: dotnet build Contoso.DesktopApp.sln --configuration Release --no-restore
+        displayName: Build
+        workingDirectory: src
+        env:
+          DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
+      - script: >-
+          dotnet tool run dotnet-coverage collect
+          "dotnet test --no-build --configuration Release --verbosity normal --logger trx --results-directory $(Agent.TempDirectory)\TestResults --filter TestCategory!=UI"
+          -f xml -o coverage.xml
+        displayName: NUnit tests (unit + integration) with coverage
+        workingDirectory: src
+
+      - task: PublishTestResults@2
+        displayName: Publish test results
+        condition: succeededOrFailed()
+        inputs:
+          testResultsFormat: VSTest
+          testResultsFiles: '**/*.trx'
+          searchFolder: $(Agent.TempDirectory)\TestResults
+          testRunTitle: 'NUnit ($(Build.BuildId))'
+
+      - script: dotnet tool run dotnet-sonarscanner end /d:sonar.token="%SONAR_TOKEN%"
+        displayName: Sonar - end analysis
+        workingDirectory: src
+        env:
+          SONAR_TOKEN: $(SONAR_TOKEN)
+
+      - powershell: |
+          $out = dotnet list Contoso.DesktopApp.sln package --vulnerable --include-transitive 2>&1 | Out-String
+          Write-Host $out
+          if ($out -match 'has the following vulnerable packages') {
+            Write-Host '##vso[task.logissue type=warning]Vulnerable NuGet packages found'
+          }
+        displayName: NuGet vulnerability audit (warning only)
+        workingDirectory: src

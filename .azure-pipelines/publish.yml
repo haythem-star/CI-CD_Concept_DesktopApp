@@ -1,0 +1,201 @@
+#   Build -> UI tests -> Package & sign -> Publish (needs approval)
+name: Publish
+
+trigger:
+  branches:
+    exclude:
+      - '*'
+  tags:
+    include:
+      - 'v*'
+pr: none
+
+variables:
+  - group: desktop-release                   # Key Vault-backed: SigningKeyVaultUrl, SigningCertName, SigningTenantId, SigningClientId, SigningClientSecret, storageAccount
+
+stages:
+  # 1. BUILD - version comes from the git tag (GitVersion)
+  - stage: Build
+    jobs:
+      - job: Build
+        pool:
+          name: Win-Build
+        workspace:
+          clean: all
+        steps:
+          - checkout: self
+            fetchDepth: 0                    # GitVersion needs the full history
+
+          - task: UseDotNet@2
+            displayName: Set up .NET 8
+            inputs:
+              packageType: sdk
+              version: 8.x
+
+          - script: dotnet tool restore
+            displayName: Restore dotnet tools
+
+          - powershell: |
+              $v = (dotnet gitversion /showvariable SemVer).Trim()
+              Write-Host "Version: $v"
+              Write-Host "##vso[build.updatebuildnumber]$v"
+            displayName: Set version from tag
+
+          - task: NuGetAuthenticate@1
+            displayName: Authenticate to internal NuGet feed
+
+          - script: dotnet restore Contoso.DesktopApp.sln
+            displayName: Restore dependencies
+            workingDirectory: src
+
+          - script: dotnet build Contoso.DesktopApp.sln --configuration Release --no-restore -p:Version=$(Build.BuildNumber)
+            displayName: Build
+            workingDirectory: src
+            env:
+              DOTNET_CLI_TELEMETRY_OPTOUT: 1
+
+          - script: dotnet publish Contoso.DesktopApp/Contoso.DesktopApp.csproj --configuration Release --no-build --output $(Build.ArtifactStagingDirectory)\app
+            displayName: Publish app
+            workingDirectory: src
+
+          - script: dotnet publish ..\tests\Contoso.DesktopApp.UiTests\Contoso.DesktopApp.UiTests.csproj --configuration Release --no-build --output $(Build.ArtifactStagingDirectory)\ui-tests
+            displayName: Publish UI tests
+            workingDirectory: src
+
+          - publish: $(Build.ArtifactStagingDirectory)\app
+            artifact: app-binaries
+            displayName: Upload artifact - app-binaries
+
+          - publish: $(Build.ArtifactStagingDirectory)\ui-tests
+            artifact: ui-tests
+            displayName: Upload artifact - ui-tests
+
+  # 2. UI TESTS - dedicated Windows agent with an interactive desktop session
+  - stage: UiTests
+    displayName: UI tests
+    dependsOn: Build
+    jobs:
+      - job: UiTests
+        pool:
+          name: Win-UI-Interactive
+          demands:
+            - InteractiveSession -equals true   # tells Azure Pipelines "only run this job on an agent that has this specific capability"
+        workspace:
+          clean: all
+        steps:
+          - checkout: none
+          - download: current                   # app-binaries + ui-tests
+
+          - powershell: |
+              if (-not [Environment]::UserInteractive) { throw 'Agent is not running in an interactive session' }
+              Get-Process -Name 'Contoso.DesktopApp' -ErrorAction SilentlyContinue | Stop-Process -Force
+              New-Item -ItemType Directory -Force -Path "$(Agent.TempDirectory)\screenshots" | Out-Null
+            displayName: Prepare interactive session
+
+          - script: >-
+              dotnet test $(Pipeline.Workspace)\ui-tests\Contoso.DesktopApp.UiTests.dll
+              --filter TestCategory=UI --logger trx
+              --results-directory $(Agent.TempDirectory)\TestResults
+            displayName: Run UI tests (NUnit)
+            env:
+              APP_UNDER_TEST: $(Pipeline.Workspace)\app-binaries\Contoso.DesktopApp.exe
+              UI_SCREENSHOT_DIR: $(Agent.TempDirectory)\screenshots
+
+          - task: PublishTestResults@2
+            displayName: Publish UI test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: VSTest
+              testResultsFiles: '**/*.trx'
+              searchFolder: $(Agent.TempDirectory)\TestResults
+              testRunTitle: 'UI tests ($(Build.BuildNumber))'
+
+          - publish: $(Agent.TempDirectory)\screenshots
+            artifact: ui-screenshots
+            displayName: Upload screenshots on failure
+            condition: failed()
+
+  # 3. PACKAGE - sign binaries, build installer, sign installer
+  - stage: Package
+    displayName: Package & sign
+    dependsOn: UiTests
+    jobs:
+      - job: Package
+        pool:
+          name: Win-Build
+        workspace:
+          clean: all
+        steps:
+          - checkout: self
+          - download: current
+            artifact: app-binaries
+
+          - task: NuGetAuthenticate@1
+            displayName: Authenticate to internal NuGet feed
+
+          - template: templates/sign.yml
+            parameters:
+              folder: $(Pipeline.Workspace)\app-binaries
+              include: Contoso.*.dll,Contoso.DesktopApp.exe
+
+          - script: >-
+              dotnet build installer\Contoso.Installer\Contoso.Installer.wixproj
+              --configuration Release
+              -p:PayloadDir=$(Pipeline.Workspace)\app-binaries
+              -p:ProductVersion=$(msiVersion)
+              --output $(Build.ArtifactStagingDirectory)\installer
+            displayName: Build installer (WiX)
+
+          - template: templates/sign.yml
+            parameters:
+              folder: $(Build.ArtifactStagingDirectory)\installer
+              include: '*.msi'
+
+          - powershell: |
+              $dir = "$(Build.ArtifactStagingDirectory)\installer"
+              Get-ChildItem "$dir\*.msi" | ForEach-Object {
+                "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash)  $($_.Name)" | Out-File "$dir\SHA256SUMS.txt" -Append -Encoding ascii
+              }
+            displayName: Generate SHA-256 checksums
+
+          - publish: $(Build.ArtifactStagingDirectory)\installer
+            artifact: installer
+            displayName: Upload artifact - installer
+
+  # 4. PUBLISH - manual approval on the environment, only real version tags
+  - stage: Publish
+    displayName: Publish
+    dependsOn: Package
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+    jobs:
+      - deployment: Publish
+        environment: desktop-release            # approval check configured here
+        pool:
+          name: Win-Build                       # Azure CLI installed on the agent
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: installer
+
+                - task: AzureCLI@2
+                  displayName: Upload installer to storage
+                  inputs:
+                    azureSubscription: sc-desktop-release
+                    scriptType: ps
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      $src = "$(Pipeline.Workspace)\installer"
+
+                      # Versioned folder: never overwritten
+                      az storage blob upload-batch --account-name $(storageAccount) --auth-mode login `
+                        --destination releases --destination-path "installer/$(Build.BuildNumber)" `
+                        --source $src --overwrite false
+                      if ($LASTEXITCODE -ne 0) { throw 'Upload (versioned) failed' }
+
+                      # 'latest' is overwritten, same idea as my S3 companion/latest
+                      az storage blob upload-batch --account-name $(storageAccount) --auth-mode login `
+                        --destination releases --destination-path "installer/latest" `
+                        --source $src --overwrite true
+                      if ($LASTEXITCODE -ne 0) { throw 'Upload (latest) failed' }

@@ -1,0 +1,35 @@
+# Signs files with a certificate that stays in Azure Key Vault (AzureSignTool).
+# Used twice: for the binaries, then for the installer.
+parameters:
+  - name: folder
+    type: string
+  - name: include
+    type: string
+
+steps:
+  - powershell: |
+      if (-not (Get-Command AzureSignTool -ErrorAction SilentlyContinue)) { dotnet tool install --global AzureSignTool }
+      $files = Get-ChildItem -Path '${{ parameters.folder }}' -Include ${{ parameters.include }} -Recurse -File
+      if (-not $files) { throw 'No files found to sign' }
+      $list = Join-Path $env:AGENT_TEMPDIRECTORY 'files-to-sign.txt'
+      $files.FullName | Set-Content $list
+      AzureSignTool sign `
+        --azure-key-vault-url $env:KV_URL `
+        --azure-key-vault-tenant-id $env:KV_TENANT_ID `
+        --azure-key-vault-client-id $env:KV_CLIENT_ID `
+        --azure-key-vault-client-secret $env:KV_CLIENT_SECRET `
+        --azure-key-vault-certificate $env:KV_CERT `
+        --timestamp-rfc3161 http://timestamp.digicert.com `
+        --timestamp-digest sha256 --file-digest sha256 `
+        --input-file-list $list
+      if ($LASTEXITCODE -ne 0) { throw 'Code signing failed' }
+    displayName: Sign ${{ parameters.include }}
+    env:
+      KV_URL: $(SigningKeyVaultUrl)
+      KV_TENANT_ID: $(SigningTenantId)
+      KV_CLIENT_ID: $(SigningClientId)
+      KV_CLIENT_SECRET: $(SigningClientSecret)
+      KV_CERT: $(SigningCertName)
+
+
+# reference: https://github.com/vcsjones/AzureSignTool/blob/v4.0.1/README.md
